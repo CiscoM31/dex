@@ -7,10 +7,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"github.com/go-ldap/ldap/v3"
 	"net"
 	"os"
 	"strings"
+
+	"github.com/go-ldap/ldap/v3"
 
 	"github.com/dexidp/dex/connector"
 	"github.com/dexidp/dex/pkg/log"
@@ -60,7 +61,7 @@ import (
 type UserMatcher struct {
 	UserAttr  string `json:"userAttr"`
 	GroupAttr string `json:"groupAttr"`
-	//Look for parent groups recursively
+	// Look for parent groups recursively
 	Recursive          bool   `json:"recursive"`
 	RecursionGroupAttr string `json:"recursionGroupAttr"`
 }
@@ -144,7 +145,7 @@ type Config struct {
 		// TODO: should be eventually removed from the code
 		UserAttr  string `json:"userAttr"`
 		GroupAttr string `json:"groupAttr"`
-		//Look for parent groups recursively
+		// Look for parent groups recursively
 		Recursive          bool   `json:"recursive"`
 		RecursionGroupAttr string `json:"recursionGroupAttr"`
 
@@ -706,6 +707,18 @@ func (c *ldapConnector) queryGroups(ctx context.Context, memberAttr string, dn s
 			req.BaseDN, scopeString(req.Scope), req.Filter)
 		resp, err := conn.Search(req)
 		if err != nil {
+			// This addition for error handling is necessary to avoid returning an error when no groups are found
+			// for the case where the user's LDAP configuration is set up to use multiple domains.
+			// Normally when it is a single domain LDAP server and no query is matched, an empty result and no error is returned.
+			// For single domain case the search continues with the next group in the list.
+			// However in the multidomain case when a top level domain base DN is used, the search will return an error if no groups are found.
+			// We cannot return an error in this case, as this nested search will continue until no higher level parent group is found.
+			// This means that in the multidomain case with a top level domain as DN, the search will return an error at some point.
+			// We need to handle this "no groups" error and allow the search to continue.
+			if ldapErr, ok := err.(*ldap.Error); ok && ldapErr.ResultCode == ldap.LDAPResultNoSuchObject {
+				c.logger.Infof("ldap: Multi-domain groups search with filter %q returned no groups", filter)
+				return nil
+			}
 			return fmt.Errorf("ldap: search failed: %v", err)
 		}
 		groups = append(groups, resp.Entries...)
