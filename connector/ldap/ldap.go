@@ -22,7 +22,7 @@ import (
 // the username and password given to the connector. The second to use the user
 // entry to search for groups.
 //
-// An example config:
+// An example configuration:
 //
 //     type: ldap
 //     config:
