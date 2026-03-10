@@ -433,28 +433,33 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.Entry, found bool, err error) {
 	var filter string
 	escapedUsername := ldap.EscapeFilter(username)
+	var usernameAttrs []string
 
-	// Split username attribute by comma to support multiple search attributes
-	usernameAttrs := strings.Split(c.UserSearch.Username, ",")
+	// Handle special case for backward compatibility: mailOrSAMAccountName
+	if c.UserSearch.Username == "mailOrSAMAccountName" {
+		filter = fmt.Sprintf("(|(mail=%s)(sAMAccountName=%s))", escapedUsername, escapedUsername)
+		usernameAttrs = []string{"mail", "sAMAccountName"}
+	} else {
+		// Split username attribute by comma to support multiple search attributes
+		usernameAttrs = strings.Split(c.UserSearch.Username, ",")
 
-	attrFilters := make([]string, 0, len(usernameAttrs))
-	for _, attr := range usernameAttrs {
-		attr = strings.TrimSpace(attr)
-		if attr != "" {
-			attrFilters = append(attrFilters, fmt.Sprintf("(%s=%s)", attr, escapedUsername))
+		attrFilters := make([]string, 0, len(usernameAttrs))
+		for _, attr := range usernameAttrs {
+			attr = strings.TrimSpace(attr)
+			if attr != "" {
+				attrFilters = append(attrFilters, fmt.Sprintf("(%s=%s)", attr, escapedUsername))
+			}
+		}
+		if len(attrFilters) == 1 {
+			filter = attrFilters[0] // Skip OR wrapper for single attribute
+		} else {
+			filter = fmt.Sprintf("(|%s)", strings.Join(attrFilters, ""))
 		}
 	}
-	if len(attrFilters) == 1 {
-		filter = attrFilters[0] // Skip OR wrapper for single attribute
-	} else {
-		filter = fmt.Sprintf("(|%s)", strings.Join(attrFilters, ""))
-	}
 
+	// Combine with UserSearch.Filter if present (applies to both special case and comma-separated)
 	if c.UserSearch.Filter != "" {
 		filter = fmt.Sprintf("(&%s%s)", c.UserSearch.Filter, filter)
-	}
-	if c.UserSearch.Username == "mailOrSAMAccountName" {
-		filter = fmt.Sprintf("(|(mail=%s)(sAMAccountName=%s))", ldap.EscapeFilter(username), ldap.EscapeFilter(username))
 	}
 
 	// Initial search.
