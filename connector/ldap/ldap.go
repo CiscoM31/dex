@@ -36,7 +36,9 @@ import (
 //         # Would translate to the query "(&(objectClass=person)(|(uid=<username>)(mail=<username>)))"
 //         baseDN: cn=users,dc=example,dc=com
 //         filter: "(objectClass=person)"
-//         username: uid,mail
+//         username:
+//         - uid
+//         - mail
 //         idAttr: uid
 //         emailAttr: mail
 //         nameAttr: name
@@ -56,6 +58,27 @@ import (
 //           groupAttr: member
 //         nameAttr: name
 //
+
+// UsernameAttributes represents one or more LDAP attributes to match against
+// the username input. It supports unmarshaling from both a single string
+// (e.g. "uid") and a list of strings (e.g. ["uid", "mail"]).
+type UsernameAttributes []string
+
+func (u *UsernameAttributes) UnmarshalJSON(data []byte) error {
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*u = arr
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("username must be a string or list of strings")
+	}
+	if s != "" {
+		*u = UsernameAttributes{s}
+	}
+	return nil
+}
 
 // UserMatcher holds information about user and group matching.
 type UserMatcher struct {
@@ -110,9 +133,10 @@ type Config struct {
 		// Optional filter to apply when searching the directory. For example "(objectClass=person)"
 		Filter string `json:"filter"`
 
-		// Attributes (comma-separated) to match (OR)against the inputted username. This will be translated and combined
-		// with the other filter as "(|(<attr1>=<username>)(<attr2>=<username>))".
-		Username string `json:"username"`
+		// Attribute(s) to match against the inputted username. Accepts a single string
+		// or a list of strings. When multiple attributes are specified, an OR filter is
+		// constructed: "(|(<attr1>=<username>)(<attr2>=<username>))".
+		Username UsernameAttributes `json:"username"`
 
 		// Can either be:
 		// * "sub" - search the whole sub tree
@@ -245,13 +269,16 @@ func (c *Config) openConnector(logger log.Logger) (*ldapConnector, error) {
 	}{
 		{"host", c.Host},
 		{"userSearch.baseDN", c.UserSearch.BaseDN},
-		{"userSearch.username", c.UserSearch.Username},
 	}
 
 	for _, field := range requiredFields {
 		if field.val == "" {
 			return nil, fmt.Errorf("ldap: missing required field %q", field.name)
 		}
+	}
+
+	if len(c.UserSearch.Username) == 0 {
+		return nil, fmt.Errorf("ldap: missing required field %q", "userSearch.username")
 	}
 
 	var (
@@ -301,7 +328,7 @@ func (c *Config) openConnector(logger log.Logger) (*ldapConnector, error) {
 
 	// TODO(nabokihms): remove it after deleting deprecated groupSearch options
 	c.GroupSearch.UserMatchers = userMatchers(c, logger)
-	return &ldapConnector{*c, userSearchScope, groupSearchScope, tlsConfig, logger}, nil
+	return &ldapConnector{*c, userSearchScope, groupSearchScope, tlsConfig, c.UserSearch.Username, logger}, nil
 }
 
 type ldapConnector struct {
@@ -311,6 +338,8 @@ type ldapConnector struct {
 	groupSearchScope int
 
 	tlsConfig *tls.Config
+
+	usernameAttrs []string
 
 	logger log.Logger
 }
@@ -410,11 +439,16 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 		ident.Email = c.getAttr(user, c.UserSearch.EmailAttr)
 		lSamName = c.getAttr(user, SamAccountNameAttr)
 
-		// If username search is mailOrSAMAccountName, skip email validation if sAMAccountName is present
-		if c.UserSearch.Username == "mailOrSAMAccountName" {
-			if ident.Email == "" && lSamName == "" {
-				missing = append(missing, c.UserSearch.EmailAttr)
+		// When sAMAccountName is a search attribute, skip email validation if sAMAccountName is present (AD compatibility)
+		hasSAMAttr := false
+		for _, a := range c.usernameAttrs {
+			if a == SamAccountNameAttr {
+				hasSAMAttr = true
+				break
 			}
+		}
+		if hasSAMAttr && lSamName != "" {
+			// Allow login without email when found via sAMAccountName
 		} else if ident.Email == "" {
 			missing = append(missing, c.UserSearch.EmailAttr)
 		}
@@ -433,28 +467,15 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.Entry, found bool, err error) {
 	var filter string
 	escapedUsername := ldap.EscapeFilter(username)
-	var usernameAttrs []string
 
-	// Handle special case for backward compatibility: mailOrSAMAccountName
-	if c.UserSearch.Username == "mailOrSAMAccountName" {
-		filter = fmt.Sprintf("(|(mail=%s)(sAMAccountName=%s))", escapedUsername, escapedUsername)
-		usernameAttrs = []string{"mail", "sAMAccountName"}
+	attrFilters := make([]string, 0, len(c.usernameAttrs))
+	for _, attr := range c.usernameAttrs {
+		attrFilters = append(attrFilters, fmt.Sprintf("(%s=%s)", attr, escapedUsername))
+	}
+	if len(attrFilters) == 1 {
+		filter = attrFilters[0]
 	} else {
-		// Split username attribute by comma to support multiple search attributes
-		usernameAttrs = strings.Split(c.UserSearch.Username, ",")
-
-		attrFilters := make([]string, 0, len(usernameAttrs))
-		for _, attr := range usernameAttrs {
-			attr = strings.TrimSpace(attr)
-			if attr != "" {
-				attrFilters = append(attrFilters, fmt.Sprintf("(%s=%s)", attr, escapedUsername))
-			}
-		}
-		if len(attrFilters) == 1 {
-			filter = attrFilters[0] // Skip OR wrapper for single attribute
-		} else {
-			filter = fmt.Sprintf("(|%s)", strings.Join(attrFilters, ""))
-		}
+		filter = fmt.Sprintf("(|%s)", strings.Join(attrFilters, ""))
 	}
 
 	// Combine with UserSearch.Filter if present (applies to both special case and comma-separated)
@@ -476,10 +497,7 @@ func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.E
 		},
 	}
 
-	for _, attr := range usernameAttrs {
-		attr = strings.TrimSpace(attr)
-		req.Attributes = append(req.Attributes, attr)
-	}
+	req.Attributes = append(req.Attributes, c.usernameAttrs...)
 
 	for _, matcher := range c.GroupSearch.UserMatchers {
 		req.Attributes = append(req.Attributes, matcher.UserAttr)
