@@ -74,8 +74,14 @@ func (u *UsernameAttributes) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return fmt.Errorf("username must be a string or list of strings")
 	}
+	s = strings.TrimSpace(s)
 	if s != "" {
-		*u = UsernameAttributes{s}
+		// Backward compatibility: mailOrSAMAccountName was a special keyword for AD
+		if s == "mailOrSAMAccountName" {
+			*u = UsernameAttributes{"mail", "sAMAccountName"}
+		} else {
+			*u = UsernameAttributes{s}
+		}
 	}
 	return nil
 }
@@ -432,25 +438,24 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 			missing = append(missing, c.UserSearch.PreferredUsernameAttrAttr)
 		}
 	}
-	var lSamName string
 	if c.UserSearch.EmailSuffix != "" {
 		ident.Email = ident.Username + "@" + c.UserSearch.EmailSuffix
 	} else {
 		ident.Email = c.getAttr(user, c.UserSearch.EmailAttr)
-		lSamName = c.getAttr(user, SamAccountNameAttr)
 
-		// When sAMAccountName is a search attribute, skip email validation if sAMAccountName is present (AD compatibility)
-		hasSAMAttr := false
-		for _, a := range c.usernameAttrs {
-			if a == SamAccountNameAttr {
-				hasSAMAttr = true
-				break
+		// Skip email requirement when user has at least one username search attribute (AD, IdM, OpenLDAP compatibility).
+		// AD users may lack mail but have sAMAccountName; IdM/OpenLDAP users with uid-only may lack mail in edge cases.
+		if ident.Email == "" {
+			hasUsernameAttr := false
+			for _, attr := range c.usernameAttrs {
+				if c.getAttr(user, attr) != "" {
+					hasUsernameAttr = true
+					break
+				}
 			}
-		}
-		if hasSAMAttr && lSamName != "" {
-			// Allow login without email when found via sAMAccountName
-		} else if ident.Email == "" {
-			missing = append(missing, c.UserSearch.EmailAttr)
+			if !hasUsernameAttr {
+				missing = append(missing, c.UserSearch.EmailAttr)
+			}
 		}
 	}
 

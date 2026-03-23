@@ -574,6 +574,7 @@ func TestUsernameAttributesUnmarshal(t *testing.T) {
 		{name: "array of strings", json: `["uid","mail"]`, want: UsernameAttributes{"uid", "mail"}},
 		{name: "single element array", json: `["cn"]`, want: UsernameAttributes{"cn"}},
 		{name: "empty string", json: `""`, want: nil},
+		{name: "mailOrSAMAccountName backward compat", json: `"mailOrSAMAccountName"`, want: UsernameAttributes{"mail", "sAMAccountName"}},
 		{name: "invalid type", json: `123`, wantErr: true},
 	}
 
