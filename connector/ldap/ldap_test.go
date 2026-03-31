@@ -71,28 +71,28 @@ func TestQuery(t *testing.T) {
 			},
 		},
 		{
-			name:      "invalidpassword",
-			username:  "jane",
-			password:  "badpassword",
-			wantBadPW: true,
+			name:     "invalidpassword",
+			username: "jane",
+			password: "badpassword",
+			wantErr:  true,
 		},
 		{
-			name:      "invaliduser",
-			username:  "idontexist",
-			password:  "foo",
-			wantBadPW: true, // Want invalid password, not a query error.
+			name:     "invaliduser",
+			username: "idontexist",
+			password: "foo",
+			wantErr:  true,
 		},
 		{
-			name:      "invalid wildcard username",
-			username:  "a*", // wildcard query is not allowed
-			password:  "foo",
-			wantBadPW: true, // Want invalid password, not a query error.
+			name:     "invalid wildcard username",
+			username: "a*",
+			password: "foo",
+			wantErr:  true,
 		},
 		{
-			name:      "invalid wildcard password",
-			username:  "john",
-			password:  "*",  // wildcard password is not allowed
-			wantBadPW: true, // Want invalid password, not a query error.
+			name:     "invalid wildcard password",
+			username: "john",
+			password: "*",
+			wantErr:  true,
 		},
 	}
 
@@ -168,16 +168,16 @@ func TestUserFilter(t *testing.T) {
 			},
 		},
 		{
-			name:      "invalidpassword",
-			username:  "jane",
-			password:  "badpassword",
-			wantBadPW: true,
+			name:     "invalidpassword",
+			username: "jane",
+			password: "badpassword",
+			wantErr:  true,
 		},
 		{
-			name:      "invaliduser",
-			username:  "idontexist",
-			password:  "foo",
-			wantBadPW: true, // Want invalid password, not a query error.
+			name:     "invaliduser",
+			username: "idontexist",
+			password: "foo",
+			wantErr:  true,
 		},
 	}
 
