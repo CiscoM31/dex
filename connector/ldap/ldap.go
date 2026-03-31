@@ -75,6 +75,12 @@ func (u *UsernameAttributes) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return fmt.Errorf("username must be a string or list of strings")
 	}
+	s = strings.TrimSpace(s)
+	// Backward compatibility: mailOrSAMAccountName was a special keyword for AD
+	if strings.EqualFold(s, "mailOrSAMAccountName") {
+		*u = UsernameAttributes{"mail", "sAMAccountName"}
+		return nil
+	}
 	if s != "" {
 		*u = UsernameAttributes{s}
 	}
@@ -437,7 +443,18 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 	if c.UserSearch.EmailSuffix != "" {
 		ident.Email = ident.Username + "@" + c.UserSearch.EmailSuffix
 	} else if ident.Email = c.getAttr(user, c.UserSearch.EmailAttr); ident.Email == "" {
-		missing = append(missing, c.UserSearch.EmailAttr)
+		// Skip email requirement when user has at least one username search attribute.
+		// AD users may lack mail but have sAMAccountName; IdM/OpenLDAP users with uid-only may lack mail in edge cases.
+		hasUsernameAttr := false
+		for _, attr := range c.UserSearch.Username {
+			if c.getAttr(user, attr) != "" {
+				hasUsernameAttr = true
+				break
+			}
+		}
+		if !hasUsernameAttr {
+			missing = append(missing, c.UserSearch.EmailAttr)
+		}
 	}
 	// TODO(ericchiang): Let this value be set from an attribute.
 	ident.EmailVerified = true
