@@ -91,6 +91,10 @@ func (u *UsernameAttributes) UnmarshalJSON(data []byte) error {
 type UserMatcher struct {
 	UserAttr  string `json:"userAttr"`
 	GroupAttr string `json:"groupAttr"`
+	// Recursive is a legacy flag from the CiscoM31 fork. When explicitly set to
+	// false it disables recursion even if RecursionGroupAttr is non-empty. Absent
+	// (nil) means the upstream behavior applies: recurse when RecursionGroupAttr != "".
+	Recursive *bool `json:"recursive,omitempty"`
 	// Look for parent groups
 	RecursionGroupAttr string `json:"recursionGroupAttr"`
 }
@@ -676,6 +680,19 @@ func (c *ldapConnector) groups(ctx context.Context, user ldap.Entry) ([]string, 
 				c.logger.Error("ldap: groups search returned no groups", "filter", filter)
 			}
 			groups = append(groups, obtained...)
+		}
+
+		// Respect legacy Recursive flag if explicitly set to false
+		if matcher.Recursive != nil && !*matcher.Recursive {
+			for _, group := range groups {
+				name := c.getAttr(*group, c.GroupSearch.NameAttr)
+				if name == "" {
+					return nil, fmt.Errorf("ldap: group entity %q missing required attribute %q",
+						group.DN, c.GroupSearch.NameAttr)
+				}
+				groupNames = append(groupNames, name)
+			}
+			continue
 		}
 
 		// If RecursionGroupAttr is not set, convert direct groups into names and return
