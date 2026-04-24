@@ -34,10 +34,12 @@ import (
 //       bindDN: uid=serviceaccount,cn=users,dc=example,dc=com
 //       bindPW: password
 //       userSearch:
-//         # Would translate to the query "(&(objectClass=person)(uid=<username>))"
+//         # Would translate to the query "(&(objectClass=person)(|(uid=<username>)(mail=<username>)))"
 //         baseDN: cn=users,dc=example,dc=com
 //         filter: "(objectClass=person)"
-//         username: uid
+//         username:
+//         - uid
+//         - mail
 //         idAttr: uid
 //         emailAttr: mail
 //         nameAttr: name
@@ -58,10 +60,41 @@ import (
 //         nameAttr: name
 //
 
+// UsernameAttributes represents one or more LDAP attributes to match against
+// the username input. It supports unmarshaling from both a single string
+// (e.g. "uid") and a list of strings (e.g. ["uid", "mail"]).
+type UsernameAttributes []string
+
+func (u *UsernameAttributes) UnmarshalJSON(data []byte) error {
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*u = arr
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("username must be a string or list of strings")
+	}
+	s = strings.TrimSpace(s)
+	// Backward compatibility: mailOrSAMAccountName was a special keyword for AD
+	if strings.EqualFold(s, "mailOrSAMAccountName") {
+		*u = UsernameAttributes{"mail", "sAMAccountName"}
+		return nil
+	}
+	if s != "" {
+		*u = UsernameAttributes{s}
+	}
+	return nil
+}
+
 // UserMatcher holds information about user and group matching.
 type UserMatcher struct {
 	UserAttr  string `json:"userAttr"`
 	GroupAttr string `json:"groupAttr"`
+	// Recursive is a legacy flag from the CiscoM31 fork. When explicitly set to
+	// false it disables recursion even if RecursionGroupAttr is non-empty. Absent
+	// (nil) means the upstream behavior applies: recurse when RecursionGroupAttr != "".
+	Recursive *bool `json:"recursive,omitempty"`
 	// Look for parent groups
 	RecursionGroupAttr string `json:"recursionGroupAttr"`
 }
@@ -110,9 +143,10 @@ type Config struct {
 		// Optional filter to apply when searching the directory. For example "(objectClass=person)"
 		Filter string `json:"filter"`
 
-		// Attribute to match against the inputted username. This will be translated and combined
-		// with the other filter as "(<attr>=<username>)".
-		Username string `json:"username"`
+		// Attribute(s) to match against the inputted username. Accepts a single string
+		// or a list of strings. When multiple attributes are specified, an OR filter is
+		// constructed: "(|(<attr1>=<username>)(<attr2>=<username>))".
+		Username UsernameAttributes `json:"username"`
 
 		// Can either be:
 		// * "sub" - search the whole sub tree
@@ -242,13 +276,16 @@ func (c *Config) openConnector(logger *slog.Logger) (*ldapConnector, error) {
 	}{
 		{"host", c.Host},
 		{"userSearch.baseDN", c.UserSearch.BaseDN},
-		{"userSearch.username", c.UserSearch.Username},
 	}
 
 	for _, field := range requiredFields {
 		if field.val == "" {
 			return nil, fmt.Errorf("ldap: missing required field %q", field.name)
 		}
+	}
+
+	if len(c.UserSearch.Username) == 0 {
+		return nil, fmt.Errorf("ldap: missing required field %q", "userSearch.username")
 	}
 
 	var (
@@ -298,7 +335,7 @@ func (c *Config) openConnector(logger *slog.Logger) (*ldapConnector, error) {
 
 	// TODO(nabokihms): remove it after deleting deprecated groupSearch options
 	c.GroupSearch.UserMatchers = userMatchers(c, logger)
-	return &ldapConnector{*c, userSearchScope, groupSearchScope, tlsConfig, logger}, nil
+	return &ldapConnector{*c, userSearchScope, groupSearchScope, tlsConfig, c.UserSearch.Username, logger}, nil
 }
 
 type ldapConnector struct {
@@ -308,6 +345,8 @@ type ldapConnector struct {
 	groupSearchScope int
 
 	tlsConfig *tls.Config
+
+	usernameAttrs []string
 
 	logger *slog.Logger
 }
@@ -408,7 +447,18 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 	if c.UserSearch.EmailSuffix != "" {
 		ident.Email = ident.Username + "@" + c.UserSearch.EmailSuffix
 	} else if ident.Email = c.getAttr(user, c.UserSearch.EmailAttr); ident.Email == "" {
-		missing = append(missing, c.UserSearch.EmailAttr)
+		// Skip email requirement when user has at least one username search attribute.
+		// AD users may lack mail but have sAMAccountName; IdM/OpenLDAP users with uid-only may lack mail in edge cases.
+		hasUsernameAttr := false
+		for _, attr := range c.UserSearch.Username {
+			if c.getAttr(user, attr) != "" {
+				hasUsernameAttr = true
+				break
+			}
+		}
+		if !hasUsernameAttr {
+			missing = append(missing, c.UserSearch.EmailAttr)
+		}
 	}
 	// TODO(ericchiang): Let this value be set from an attribute.
 	ident.EmailVerified = true
@@ -421,7 +471,19 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 }
 
 func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.Entry, found bool, err error) {
-	filter := fmt.Sprintf("(%s=%s)", c.UserSearch.Username, ldap.EscapeFilter(username))
+	var filter string
+	escapedUsername := ldap.EscapeFilter(username)
+
+	attrFilters := make([]string, 0, len(c.usernameAttrs))
+	for _, attr := range c.usernameAttrs {
+		attrFilters = append(attrFilters, fmt.Sprintf("(%s=%s)", attr, escapedUsername))
+	}
+	if len(attrFilters) == 1 {
+		filter = attrFilters[0] // Skip OR wrapper for single attribute
+	} else {
+		filter = fmt.Sprintf("(|%s)", strings.Join(attrFilters, ""))
+	}
+
 	if c.UserSearch.Filter != "" {
 		filter = fmt.Sprintf("(&%s%s)", c.UserSearch.Filter, filter)
 	}
@@ -438,6 +500,8 @@ func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.E
 			// TODO(ericchiang): what if this contains duplicate values?
 		},
 	}
+
+	req.Attributes = append(req.Attributes, c.usernameAttrs...)
 
 	for _, matcher := range c.GroupSearch.UserMatchers {
 		req.Attributes = append(req.Attributes, matcher.UserAttr)
@@ -461,7 +525,8 @@ func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.E
 	switch n := len(resp.Entries); n {
 	case 0:
 		c.logger.Error("no results returned for filter", "filter", filter)
-		return ldap.Entry{}, false, nil
+		return ldap.Entry{}, false, fmt.Errorf("ldap: no results returned for filter: %q LDAP Result Code %d %q",
+			filter, ldap.LDAPResultInvalidCredentials, ldap.LDAPResultCodeMap[ldap.LDAPResultInvalidCredentials])
 	case 1:
 		user = *resp.Entries[0]
 		c.logger.Info("username mapped to entry", "username", username, "user_dn", user.DN)
@@ -506,7 +571,8 @@ func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username,
 				case ldap.LDAPResultInvalidCredentials:
 					c.logger.Error("invalid password for user", "user_dn", user.DN)
 					incorrectPass = true
-					return nil
+					return fmt.Errorf("invalid credentials for user %q LDAP Result Code %d %q",
+						user.DN, ldap.LDAPResultInvalidCredentials, ldap.LDAPResultCodeMap[ldap.LDAPResultInvalidCredentials])
 				case ldap.LDAPResultConstraintViolation:
 					c.logger.Error("constraint violation for user", "user_dn", user.DN, "err", ldapErr.Error())
 					incorrectPass = true
@@ -614,6 +680,19 @@ func (c *ldapConnector) groups(ctx context.Context, user ldap.Entry) ([]string, 
 				c.logger.Error("ldap: groups search returned no groups", "filter", filter)
 			}
 			groups = append(groups, obtained...)
+		}
+
+		// Respect legacy Recursive flag if explicitly set to false
+		if matcher.Recursive != nil && !*matcher.Recursive {
+			for _, group := range groups {
+				name := c.getAttr(*group, c.GroupSearch.NameAttr)
+				if name == "" {
+					return nil, fmt.Errorf("ldap: group entity %q missing required attribute %q",
+						group.DN, c.GroupSearch.NameAttr)
+				}
+				groupNames = append(groupNames, name)
+			}
+			continue
 		}
 
 		// If RecursionGroupAttr is not set, convert direct groups into names and return

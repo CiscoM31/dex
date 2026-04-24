@@ -394,7 +394,7 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		identity, ok, err := pwConn.Login(r.Context(), scopes, username, password)
 		if err != nil {
 			s.logger.ErrorContext(r.Context(), "failed to login user", "err", err)
-			s.renderError(r, w, http.StatusInternalServerError, ErrMsgLoginError)
+			s.renderError(r, w, http.StatusInternalServerError, "Login Error.", err.Error())
 			return
 		}
 		if !ok {
@@ -1498,10 +1498,28 @@ func (s *Server) writeAccessToken(w http.ResponseWriter, resp *accessTokenRespon
 	w.Write(data)
 }
 
-func (s *Server) renderError(r *http.Request, w http.ResponseWriter, status int, description string) {
-	if err := s.templates.err(r, w, status, description); err != nil {
-		s.logger.ErrorContext(r.Context(), "server template error", "err", err)
+func (s *Server) renderError(r *http.Request, w http.ResponseWriter, status int, description string, errors ...string) {
+	if r == nil {
+		s.logger.Error("cannot render error, request not found")
+		return
 	}
+	resp := struct {
+		ErrorMessage string `json:"errorMsg"`
+		ErrorDetails string `json:"errorDetails"`
+	}{
+		description,
+		strings.Join(errors, ", "),
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		s.logger.ErrorContext(r.Context(), "failed to render error", "err", err)
+		s.tokenErrHelper(w, errServerError, "", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(status)
+	w.Write(data)
 }
 
 func (s *Server) tokenErrHelper(w http.ResponseWriter, typ string, description string, statusCode int) {

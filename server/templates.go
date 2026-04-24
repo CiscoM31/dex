@@ -333,19 +333,6 @@ func (t *templates) oob(r *http.Request, w http.ResponseWriter, code string) err
 	return renderTemplate(w, t.oobTmpl, data)
 }
 
-func (t *templates) err(r *http.Request, w http.ResponseWriter, errCode int, errMsg string) error {
-	w.WriteHeader(errCode)
-	data := struct {
-		ErrType string
-		ErrMsg  string
-		ReqPath string
-	}{http.StatusText(errCode), errMsg, r.URL.Path}
-	if err := t.errorTmpl.Execute(w, data); err != nil {
-		return fmt.Errorf("rendering template %s failed: %s", t.errorTmpl.Name(), err)
-	}
-	return nil
-}
-
 // small io.Writer utility to determine if executing the template wrote to the underlying response writer.
 type writeRecorder struct {
 	wrote bool
